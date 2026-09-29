@@ -1,3 +1,5 @@
+//go:build linux
+
 package io_uring
 
 // Benchmarks comparing the three UDP send strategies for the QUIC send path
@@ -12,20 +14,35 @@ package io_uring
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
 )
 
 const (
+	maxPayload  = 64 * 1024
 	superBufLen = 64000 // one GSO super-buffer
 	gsoSize     = 1350      // nominal datagram size
 	batchLen    = 64        // datagrams/messages per batching unit
 	rxBuffer    = 16 << 20  // receiver socket buffer: absorb the flood
+
+	udpSegmentCmsgType = 0x67 // UDP_SEGMENT
 )
+
+func gsoControl(gsoSize uint16) []byte {
+	control := make([]byte, unix.CmsgSpace(2))
+	cmsg := (*unix.Cmsghdr)(unsafe.Pointer(&control[0]))
+	cmsg.Level = unix.IPPROTO_UDP
+	cmsg.Type = udpSegmentCmsgType
+	cmsg.SetLen(unix.CmsgLen(2))
+	binary.LittleEndian.PutUint16(control[unix.CmsgLen(2):], gsoSize)
+	return control
+}
 
 func newBenchUDP(b *testing.B) (sender *net.UDPConn, receiver *net.UDPConn) {
 	b.Helper()
@@ -66,7 +83,8 @@ func iovecFor(p []byte) unix.Iovec {
 // one syscall per datagram
 func BenchmarkSendto(b *testing.B) {
 	tx, _ := newBenchUDP(b)
-	f, err := tx.File()
+	f, err := tx.File() // keep f referenced: the finalizer would close the dup
+	defer f.Close()
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -88,7 +106,8 @@ func BenchmarkSendto(b *testing.B) {
 // one syscall per 64 KiB jumbo datagram (loopback / jumbo-MTU paths only)
 func BenchmarkSendtoJumbo(b *testing.B) {
 	tx, _ := newBenchUDP(b)
-	f, err := tx.File()
+	f, err := tx.File() // keep f referenced: the finalizer would close the dup
+	defer f.Close()
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -124,14 +143,19 @@ func BenchmarkWriteBatchGSO(b *testing.B) {
 	}
 }
 
-// io_uring SENDMSG batch, one enter per ring cycle
+// BenchmarkIOURingGSO io_uring SENDMSG batch, one enter per ring cycle.
+// TRAP: tx.File() returns an *os.File with a finalizer; keep it referenced
+// (defer Close) or the GC closes the duplicated fd mid-benchmark and every
+// send fails with EBADF.
 func BenchmarkIOURingGSO(b *testing.B) {
 	tx, _ := newBenchUDP(b)
-	f, err := tx.File()
+	f, err := tx.File() // keep f referenced: the finalizer would close the dup
+	defer f.Close()
 	if err != nil {
 		b.Fatal(err)
 	}
-	s, err := NewSender(int(f.Fd()), gsoSize)
+	defer f.Close()
+	s, err := NewSender(int(f.Fd()))
 	if err != nil {
 		b.Skipf("io_uring unavailable: %v", err)
 	}
@@ -141,11 +165,12 @@ func BenchmarkIOURingGSO(b *testing.B) {
 	for i := range supers {
 		supers[i] = make([]byte, superBufLen)
 	}
+	control := gsoControl(gsoSize)
 	b.SetBytes(int64(superBufLen) * int64(ringEntries))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for _, super := range supers {
-			if err := s.Submit(super); err != nil {
+			if err := s.Submit(super, nil, control); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -186,20 +211,21 @@ func TestSenderUDPLoopbackGSO(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Close()
-	f, err := tx.File()
+	f, err := tx.File() // keep f referenced: the finalizer would close the dup
+	defer f.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
 
-	s, err := NewSender(int(f.Fd()), gsoSize)
+	s, err := NewSender(int(f.Fd()))
 	if err != nil {
 		t.Skipf("io_uring unavailable: %v", err)
 	}
 	defer s.Close()
 
 	payload := bytes.Repeat([]byte{0xAB}, superBufLen)
-	if err := s.Submit(payload); err != nil {
+	if err := s.Submit(payload, nil, gsoControl(gsoSize)); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Flush(); err != nil {
@@ -222,21 +248,23 @@ func TestSenderUDPLoopbackBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Close()
-	f, err := tx.File()
+	f, err := tx.File() // keep f referenced: the finalizer would close the dup
+	defer f.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
 
-	s, err := NewSender(int(f.Fd()), gsoSize)
+	s, err := NewSender(int(f.Fd()))
 	if err != nil {
 		t.Skipf("io_uring unavailable: %v", err)
 	}
 	defer s.Close()
 
 	payload := bytes.Repeat([]byte{0xCD}, superBufLen)
+	control := gsoControl(gsoSize)
 	for i := 0; i < ringEntries; i++ {
-		if err := s.Submit(payload); err != nil {
+		if err := s.Submit(payload, nil, control); err != nil {
 			t.Fatal(err)
 		}
 	}

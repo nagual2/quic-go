@@ -34,6 +34,9 @@ var _ sender = &sendQueue{}
 const sendQueueCapacity = 8
 
 func newSendQueue(conn sendConn) sender {
+	if q := newIOUringSendQueue(conn); q != nil {
+		return q
+	}
 	return &sendQueue{
 		conn:        conn,
 		runStopped:  make(chan struct{}),

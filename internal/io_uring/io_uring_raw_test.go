@@ -1,3 +1,5 @@
+//go:build linux
+
 package io_uring
 
 // Low-level verification of the raw io_uring bindings, bisecting the layers:

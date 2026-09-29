@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package io_uring contains an experimental io_uring-based UDP send path for
 // the QUIC connection. It is the seed of the io_uring send-queue: one
 // io_uring_enter covers a whole batch of GSO-segmented packets, replacing
@@ -10,85 +12,74 @@ package io_uring
 import (
 	"encoding/binary"
 	"fmt"
+	"net"
 	"unsafe"
-
-	"golang.org/x/sys/unix"
 )
 
 const (
-	maxPayload  = 64 * 1024
 	ringEntries = 64
-
-	udpSegmentCmsgType = 0x67 // UDP_SEGMENT
 )
 
-// Sender submits UDP payloads through an io_uring instance. When gsoSize is
-// non-zero, each payload is handed to the kernel as a single UDP_SEGMENT-
-// tagged sendmsg, which the kernel splits into gsoSize-sized datagrams - the
-// io_uring equivalent of the GSO path in quic-go's oobConn.
+// Sender submits UDP payloads through an io_uring instance. Every payload is
+// handed to the kernel as a single sendmsg with caller-provided destination
+// address and control messages (e.g. UDP_SEGMENT for GSO), so one
+// io_uring_enter covers a whole batch of sends.
 //
-// The caller must keep every payload passed to Submit alive until the next
-// Flush returns.
+// The caller must keep every payload and control buffer passed to Submit
+// alive until the next Flush returns.
 type Sender struct {
 	ring     *rawRing
 	fd       int
-	gsoSize  uint16
 	msgs     [ringEntries]msghdrRaw
 	iovs     [ringEntries]iovecRaw
-	controls [ringEntries][]byte
+	addrs    [ringEntries][28]byte // sockaddr_in6-shaped storage, large enough for sockaddr_in
 	pending  uint32
 }
 
-func NewSender(fd int, gsoSize uint16) (*Sender, error) {
+func NewSender(fd int) (*Sender, error) {
 	ring, err := newRawRing(ringEntries)
 	if err != nil {
 		return nil, err
 	}
-	s := &Sender{ring: ring, fd: fd, gsoSize: gsoSize}
-	for i := range s.controls {
-		s.controls[i] = gsoControl(gsoSize)
-	}
-	return s, nil
-}
-
-func gsoControl(gsoSize uint16) []byte {
-	control := make([]byte, unix.CmsgSpace(2))
-	cmsg := (*unix.Cmsghdr)(unsafe.Pointer(&control[0]))
-	cmsg.Level = unix.IPPROTO_UDP
-	cmsg.Type = udpSegmentCmsgType
-	cmsg.SetLen(unix.CmsgLen(2))
-	binary.LittleEndian.PutUint16(control[unix.CmsgLen(2):], gsoSize)
-	return control
+	return &Sender{ring: ring, fd: fd}, nil
 }
 
 func (s *Sender) Close() error {
 	return s.ring.Close()
 }
 
-// Submit enqueues a single GSO payload on the ring. Call Flush once the ring
-// is full; payloads must stay alive until that Flush returns.
-func (s *Sender) Submit(data []byte) error {
+// Submit enqueues a single sendmsg on the ring. addr may be nil for connected
+// sockets; control carries marshalled cmsgs (e.g. UDP_SEGMENT) and may be
+// nil. Call Flush once the batch is complete.
+func (s *Sender) Submit(data []byte, addr *net.UDPAddr, control []byte) error {
 	if s.pending >= ringEntries {
 		return fmt.Errorf("submission queue full (%d entries)", ringEntries)
 	}
-	if len(data) > maxPayload {
-		return fmt.Errorf("payload %d exceeds %d", len(data), maxPayload)
+	if len(data) == 0 {
+		return fmt.Errorf("empty payload")
 	}
 	slot := s.pending
 	s.iovs[slot] = iovecRaw{Base: unsafe.Pointer(&data[0]), Len: uint64(len(data))}
-	s.msgs[slot] = msghdrRaw{Iov: &s.iovs[slot], IovLen: 1}
-	if s.gsoSize != 0 {
-		s.msgs[slot].Control = unsafe.Pointer(&s.controls[slot][0])
-		s.msgs[slot].ControlLen = uint64(len(s.controls[slot]))
+	m := &s.msgs[slot]
+	*m = msghdrRaw{Iov: &s.iovs[slot], IovLen: 1}
+	if addr != nil {
+		m.Name = unsafe.Pointer(&s.addrs[slot])
+		m.NameLen = packSockaddr(&s.addrs[slot], addr)
 	}
-	if _, err := s.ring.prepareSendMsg(s.fd, unsafe.Pointer(&s.msgs[slot])); err != nil {
+	if len(control) > 0 {
+		m.Control = unsafe.Pointer(&control[0])
+		m.ControlLen = uint64(len(control))
+	}
+	if _, err := s.ring.prepareSendMsg(s.fd, unsafe.Pointer(m)); err != nil {
 		return err
 	}
 	s.pending++
 	return nil
 }
 
-// Flush submits all pending SQEs and waits for their completions.
+// Flush submits all pending SQEs and waits for their completions. It drains
+// the completion queue fully and returns the first error result, so a single
+// failed send does not stall the ring.
 func (s *Sender) Flush() error {
 	pending := s.pending
 	s.pending = 0
@@ -97,4 +88,21 @@ func (s *Sender) Flush() error {
 	}
 	_, err := s.ring.reapCQEs(pending)
 	return err
+}
+
+// packSockaddr writes addr into buf as a sockaddr_in or sockaddr_in6 and
+// returns the value for msghdr.msg_namelen.
+func packSockaddr(buf *[28]byte, addr *net.UDPAddr) uint32 {
+	if ip4 := addr.IP.To4(); ip4 != nil {
+		// AF_INET, little-endian sa_family on x86_64
+		buf[0], buf[1] = 2, 0
+		binary.BigEndian.PutUint16(buf[2:4], uint16(addr.Port))
+		copy(buf[4:8], ip4)
+		return 16
+	}
+	// AF_INET6; flowinfo and scope_id are left zero
+	buf[0], buf[1] = 10, 0
+	binary.BigEndian.PutUint16(buf[2:4], uint16(addr.Port))
+	copy(buf[8:24], addr.IP.To16())
+	return 28
 }

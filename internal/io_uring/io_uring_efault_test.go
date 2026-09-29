@@ -1,3 +1,5 @@
+//go:build linux
+
 package io_uring
 
 // IORING_OP_WRITE through the ring into (a) an os.Pipe and (b) a regular

@@ -8,70 +8,88 @@
 ## Контекст и цель
 
 R3-бенчмарки показали: bulk-throughput ssh3 118–131 MB/s против OpenSSH 365–488
-(loopback, WSL). Профилирование (docs/PROFILE-2026-09-29.md в ssh3) выявило
-доминацию системных вызовов per-packet UDP I/O (39% клиента, 25% сервера);
-AES ~3% (AES-NI работает, невиновен). quic-go обновлён до v0.59.1 — throughput
-не изменился: стена фундаментальная (userspace QUIC, ядерного offload нет).
-
-Единственный нетронутый syscall-рычаг — **io_uring**: батчинг SENDMSG-операций,
-один `io_uring_enter` на кольцо вместо syscall на batch. x/sys/unix биндингов
+(loopback, WSL). Профилирование выявило доминацию системных вызовов per-packet
+UDP I/O. Единственный нетронутый syscall-рычаг — **io_uring**: батчинг
+SENDMSG-операций, один `io_uring_enter` на батч. x/sys/unix биндингов
 io_uring не содержит — написаны сырые (`internal/io_uring/io_uring_raw.go`).
 
-## Текущее состояние (коммиты f960da7a → fecb456a, ветка feat/io-uring-send)
+## Текущее состояние (сессия 2026-09-29, ветка feat/io-uring-send)
 
-Работает:
+**Всё оживлено и интегрировано:**
 
-- `io_uring_setup` (params 104 Б: 40 первый блок + sq_off 36 Б (9 полей) +
-  cq_off 32 Б (8 полей)) — сверено hexdump'ом;
-- mmap колец: SQ@off 0, CQ@0x8000000, SQE-массив@0x10000000; размеры из params;
-- **заголовки колец на ядре 6.18 паддингованы под атомики**:
-  SQ: head@0, tail@4, mask@16, entries@24, flags@32, dropped@36, array@320;
-  CQ: head@0, tail@8, mask@12, entries@20, overflow@28, cqes@44, flags@64;
-- маски и entries читаются как ЗНАЧЕНИЯ из mmap по этим офсетам
-  (sqMask=7 ✓; cq ядро удваивает: sq=8 → cq=16);
-- SQE-плейсмент байт-в-байт верифицирован (opcode/fd/len/userdata в памяти);
-- ядро потребляет SQE (sqHead 0→1) и доставляет CQE с нашим userdata (0x1234).
+- `internal/io_uring`: setup + mmap колец, адаптивный резолв CQ-layout
+  (`resolveCqLayout`), WRITE-тесты (`TestRingWritePipe/File/Stdout`) зелёные;
+- SENDMSG+GSO end-to-end (`TestSenderUDPLoopbackGSO/Batch`): кольцо + cmsg
+  UDP_SEGMENT, sockaddr-упаковка v4/v6, per-slot control-буферы;
+- `send_queue_uring.go` (package quic): `uringSendQueue` за env-флагом
+  **`QUIC_GO_IO_URING_SEND=1`** — батч до 64 пакетов, один enter на батч;
+  деградация до `conn.Write` при любой нефатальной для QUIC ошибке (ring
+  закрывается, батч пересылается fallback-путём; EMSGSIZE/PMTU — как раньше);
+- кросс-компиляция windows/darwin зелёная (stub `io_uring_stub.go`,
+  `send_queue_uring_other.go`);
+- полный suite корневого пакета зелёный.
 
-Сломано (последний блокер):
+**Бенчи (loopback, WSL, Ryzen 5 4600H, 3 прогона):**
 
-- **IORING_OP_WRITE возвращает EFAULT (-14)** — ядро не смогло прочитать
-  payload по переданному адресу. SQE долетает (userdata совпадает), значит
-  проблема в самом адресе данных или в особенностях окружения go test
-  (stdout перехвачен go test'ом — pipe; проверять через `os.Pipe` и
-  временный файл).
+| Путь | MB/s |
+|------|------|
+| Sendto (1 syscall/датаграмма) | 200–213 |
+| SendtoJumbo (64 KiB датаграммы) | 2708–3655 |
+| WriteBatch+GSO (текущий путь quic-go) | 3100–4479 (шумно) |
+| IOURingGSO (Submit 64 + 1 enter) | 3670–4350 |
 
-## TRAP-лист (набито кровью этой сессии)
+Паритет с WriteBatch+GSO на loopback — выигрыш от io_uring ожидается не в
+микробенче, а в B1 (сквозной ssh3 push, один батчер на send-очередь).
+
+## Блокеры, снятые в этой сессии (были: EFAULT + «NOP-пробы»)
+
+1. **Опкод**: 5 — это `WRITE_FIXED` (требует registered buffers → EFAULT без
+   них). `IORING_OP_WRITE` = **23** (UAPI-enum). «NOP-пробы» прошлой сессии —
+   зеро-SQE = opcode 0.
+2. **CQ-layout ядра 6.18.33.2-MS-WSL2**: mmap-содержимое CQ-кольца НЕ следует
+   reported `cq_off` — фактическая единая layout `io_rings`:
+   `sq head@0, tail@4; cq head@8, tail@12; sq_mask@16, cq_mask@20;
+   sq_entries@24, cq_entries@28; cqes@64; sq_array@320 (для sq=8)`.
+   Reported `cq_off {0,8,12,20,44,...}` — устаревший шаблон. Кросс-проверка:
+   reported `sq_off.array = 64 + cq_entries*16`, т.е. ядро само считает
+   cqes@64. Резолв адаптивный: по совпадению значений entries/mask.
+
+## TRAP-лист
 
 | № | Ловушка |
 |---|---------|
-| 1 | `params.SqOff.*` — это **байтовые офсеты в mmap с паддингом** (mask@16, entries@24, array@320), а не компактные `4*i`; значения (маска, entries) читаются из mmap по офсетам |
+| 1 | `params.SqOff.*` — байтовые офсеты в mmap с паддингом; значения (mask, entries) читаются из mmap по офсетам |
 | 2 | CQ-кольцо ядро удваивает: sq=8 → cq=16; маска = entries-1 |
-| 3 | `io_sqring_offsets` в UAPI — 9 полей (36 Б, включая Resv2); `io_cqring_offsets` — 8 полей (32 Б); первый блок params — 10 u32 (40 Б); итого 108 |
+| 3 | SQE-массив — классический mmap `IORING_OFF_SQES` (0x10000000); внутри SQ-mmap его нет (sqRing на 6.18 = 352 Б для sq=8: заголовок+индексный массив) |
 | 4 | SQ-индексный массив инициализирует приложение: identity 0..n-1 |
-| 5 | CQE-массив читается по офсету `CqOff.Cqes` (44), НЕ с нуля (там head/tail-заголовок) |
-| 6 | WSL: go1.26.0 (GOTOOLCHAIN=auto); sum.golang.org/прокси флапают точечно — ретраи; `GOSUMDB=off` блокирует скачивание toolchain; strace отсутствует; инлайн `wsl bash -lc '...$var...'` у агента съедается — только файловые скрипты |
+| 5 | **Опкоды**: `WRITE_FIXED`=5 (registered buffers, иначе EFAULT), `WRITE`=23, `SENDMSG`=9 |
+| 6 | **6.18.33.2-MS**: CQ-content по единой layout `io_rings` (head@8, tail@12, mask@20, entries@28, cqes@64), reported `cq_off` не совпадает; резолвить адаптивно (`resolveCqLayout`) |
+| 7 | **`net.UDPConn.File()` → `*os.File` с финализатором**: если не держать ссылку (defer Close), GC закрывает дублированный fd → EBADF в середине батча (маскировался под «глюк ядра») |
+| 8 | Control-буферы (UDP_SEGMENT/ECN) для кольца — **per-slot**: общий oob-буфер sconn перезаписывается до `io_uring_enter`; `Sender` требует живости data+control до возврата `Flush` |
+| 9 | WSL: go1.26.0 (GOTOOLCHAIN=auto); inline `wsl bash -lc '...$var...'` у агента съедается — файловые скрипты |
 
 ## Следующие шаги
 
-1. Прочитать UAPI ядра 6.18 (`include/uapi/linux/io_uring.h`) и путь mmap в
-   `io_uring.c` — понять, где на 6.18 лежит SQE-массив (сменился ли
-   `IORING_OFF_SQES`, появилась ли single-region схема).
-2. Оживить WRITE: тест через `os.Pipe` (гарантированно валидный fd), затем
-   файл; при EFAULT — проверить `runtime.Pinner` на payload и владельца памяти.
-3. После оживления: GSO-cmsg (UDP_SEGMENT) в SENDMSG, затем интеграция в
-   send_queue за env-флагом.
-4. PR-материал: бенчмарки A/B уже есть (`io_uring_send_test.go`),
-   доехать до `B1` через весь стек ssh3.
+1. **B1 через весь стек ssh3**: пересобрать ssh3 с replace-директивой на этот
+   форк + `QUIC_GO_IO_URING_SEND=1`, замерить bulk-throughput против базы
+   118–131 MB/s (loopback, WSL). Это главный критерий смысла всего пути.
+2. PR-подмножество: `internal/io_uring` без бенч-мусора и debug-логов
+   (`TestRingWriteStdout` пишет в stdout сырой `go test`-вывод), ruff-эквивалент
+   для Go (`gofmt`/`golangci`), только затем PR в форк.
+3. Опционально: `io_uring_register_buffers` (FIXED-опкоды) и multishot/send
+   bundling — следующий рычаг, если B1 не даст дельты.
 
 ## Критерий готовности
 
-- `TestRingWriteStdout` / `TestRingWritePipe` зелёные (res == len);
-- B1 push через io_uring-путь vs база 118–131 MB/s — разница зафиксирована;
-- остальные сьюты зелёные, Rust-интероп не тронут (`vendor/h3` не менять).
+- [x] `TestRingWriteStdout` / `TestRingWritePipe` зелёные (res == len);
+- [x] SENDMSG+GSO end-to-end зелёные;
+- [x] интеграция в send_queue за env-флагом, деградация безопасная;
+- [x] `go test .` и `go vet` зелёные, кросс-компиляция windows/darwin зелёная;
+- [ ] B1 push через io_uring-путь vs база 118–131 MB/s — разница зафиксирована;
+- [ ] остальные сьюты зелёные, Rust-интероп не тронут (`vendor/h3` не менять).
 
 ## Не потерять
 
-- Бенчмарк-факты: jumbo-датаграммы ×16 на loopback (2547 MB/s), WriteBatch+GSO
-  4076 MB/s — уже в `io_uring_send_test.go`;
-- сырой пакет не пушить в main: только PR-подмножество (internal/io_uring
-  без бенч-мусора) после оживления.
+- Бенчмарк-факты: jumbo-датаграммы ×16 на loopback, WriteBatch+GSO и
+  IOURingGSO ~4 GB/s-класс — в `io_uring_send_test.go`;
+- сырой пакет не пушить в main: только PR-подмножество после B1.

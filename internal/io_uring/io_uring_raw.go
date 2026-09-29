@@ -1,3 +1,5 @@
+//go:build linux
+
 package io_uring
 
 // Minimal raw io_uring bindings (x86_64, kernel >= 5.11): setup, ring mmap,
@@ -211,24 +213,26 @@ func (r *rawRing) enter(toSubmit, toWait uint32) error {
 	return nil
 }
 
-// reapCQEs consumes up to max completions, failing on the first error result.
+// reapCQEs consumes up to max completions, draining the queue fully and
+// returning the first error result encountered.
 func (r *rawRing) reapCQEs(max uint32) (uint32, error) {
 	var reaped uint32
+	var firstErr error
 	for reaped < max {
 		head := atomic.LoadUint32(r.cqHead)
 		tail := atomic.LoadUint32(r.cqTail)
 		if head == tail {
-			return reaped, nil
+			return reaped, firstErr
 		}
 		cqe := (*ioUringCQE)(unsafe.Pointer(&r.cqRing[r.cqesOff+(head&r.cqMask)*16]))
 		res := int32(atomic.LoadInt32((*int32)(unsafe.Pointer(&cqe.Res))))
 		atomic.StoreUint32(r.cqHead, head+1)
-		if res < 0 {
-			return reaped, fmt.Errorf("io_uring completion: %w", syscall.Errno(-res))
+		if res < 0 && firstErr == nil {
+			firstErr = fmt.Errorf("io_uring completion (userdata=%#x): %w", cqe.UserData, syscall.Errno(-res))
 		}
 		reaped++
 	}
-	return reaped, nil
+	return reaped, firstErr
 }
 
 type ioUringCQE struct {
