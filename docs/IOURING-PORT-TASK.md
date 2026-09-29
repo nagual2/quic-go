@@ -70,14 +70,25 @@ io_uring не содержит — написаны сырые (`internal/io_uri
 
 ## Следующие шаги
 
-1. **B1 через весь стек ssh3**: пересобрать ssh3 с replace-директивой на этот
-   форк + `QUIC_GO_IO_URING_SEND=1`, замерить bulk-throughput против базы
-   118–131 MB/s (loopback, WSL). Это главный критерий смысла всего пути.
-2. PR-подмножество: `internal/io_uring` без бенч-мусора и debug-логов
-   (`TestRingWriteStdout` пишет в stdout сырой `go test`-вывод), ruff-эквивалент
-   для Go (`gofmt`/`golangci`), только затем PR в форк.
-3. Опционально: `io_uring_register_buffers` (FIXED-опкоды) и multishot/send
-   bundling — следующий рычаг, если B1 не даст дельты.
+1. [ВЫПОЛНЕНО 2026-09-29] **B1 через весь стек ssh3** — вердикт: **паритет,
+   выигрыша нет**. Детали: `ssh3/docs/B1-IOURING-2026-09-29.md`.
+   - Медианы (512 MiB push, S1 loopback, 10 прогонов): stock v0.49 137.2 /
+     fork-off 129.0 / fork-on 151.3 MB/s;
+   - арбитраж строгим ABBA (8 пар): средняя попарная Δ ≈ −1.9 MB/s (−1.5%) —
+     в пределах шума;
+   - корректность: 512 MiB через кольцо бит-в-бит (cmp OK), ring-fd в клиенте
+     подтверждён;
+   - причина: v0.49-путь (WriteBatch+GSO) уже коалесцирует send'ы — число
+     sendmsg не является узким местом полного ssh3 (сходится с микробенчем).
+2. Порт на v0.49: worktree `project/quic-go-v049`, ветка `bench/io-uring-v049`
+   (cherry-pick af8a7816 c адаптацией: нет SendProbe/WriteTo, sconn хранит
+   packetInfoOOB/remoteAddr плоскими полями). База под PR в ssh3, пока ssh3
+   сидит на v0.49.
+3. PR-подмножество в форк v0.59.1: `internal/io_uring` без бенч-мусора и
+   debug-логов (`TestRingWriteStdout` пишет в stdout сырой `go test`-вывод).
+4. Опционально: `io_uring_register_buffers` (FIXED-опкоды), multishot send и
+   ЗА-соединение кольцо — следующий рычаг, если когда-нибудь вернёмся к
+   syscall-направлению; приоритет сместился на слой ssh3 и апгрейд quic-go.
 
 ## Критерий готовности
 
@@ -85,8 +96,9 @@ io_uring не содержит — написаны сырые (`internal/io_uri
 - [x] SENDMSG+GSO end-to-end зелёные;
 - [x] интеграция в send_queue за env-флагом, деградация безопасная;
 - [x] `go test .` и `go vet` зелёные, кросс-компиляция windows/darwin зелёная;
-- [ ] B1 push через io_uring-путь vs база 118–131 MB/s — разница зафиксирована;
-- [ ] остальные сьюты зелёные, Rust-интероп не тронут (`vendor/h3` не менять).
+- [x] B1 push через io_uring-путь vs база — **зафиксирован: дельта отсутствует
+  (паритет, −1.5% в ABBA)**;
+- [x] остальные сьюты зелёные, Rust-интероп не тронут (`vendor/h3` не менять).
 
 ## Не потерять
 
