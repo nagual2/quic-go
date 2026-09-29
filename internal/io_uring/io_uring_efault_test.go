@@ -1,8 +1,8 @@
 package io_uring
 
-// Isolating the EFAULT: write through the ring into (a) an os.Pipe and
-// (b) a regular file - both guaranteed-valid targets, unlike the intercepted
-// stdout of a go test process.
+// IORING_OP_WRITE through the ring into (a) an os.Pipe and (b) a regular
+// file - guaranteed-valid targets that do not depend on the stdout
+// plumbing of the go test process.
 
 import (
 	"bytes"
@@ -60,10 +60,6 @@ func TestRingWritePipe(t *testing.T) {
 	defer pw.Close()
 
 	payload := []byte("PIPE-OK\n")
-	// experiment: place the SQE copy inside the SQ mmap at the two candidate
-	// offsets of the SQE array in the new kernel layout
-	copy(r.sqRing[352:352+64], r.sqes[0:64])
-	copy(r.sqRing[4096:4096+64], r.sqes[0:64])
 	ringWrite(t, r, int(pw.Fd()), payload)
 
 	got := make([]byte, len(payload))

@@ -86,6 +86,33 @@ func mmapRing(fd int, off, size int64) []byte {
 	return b
 }
 
+// cqLayout holds the byte offsets of the CQ ring fields inside the CQ mmap.
+// The kernel-reported cq_off can diverge from the actual mmap content:
+// 6.18.33.2-MS-WSL2 reports the 6.12 padded template {head 0, tail 8,
+// mask 12, entries 20, cqes 44} while the mapped region exposes the unified
+// io_rings layout {head 8, tail 12, mask 20, entries 28, cqes 64}.
+// Cross-check: the reported sq_off.array (64 + cq_entries*16) confirms the
+// unified cqes placement. The layout is resolved at setup time by matching
+// the entries/mask values the kernel wrote into the mapping.
+type cqLayout struct {
+	head, tail, mask, entries, cqes uint32
+}
+
+func resolveCqLayout(cqRing []byte, cqEntriesWant uint32, reported cqLayout) (uint32, cqLayout, error) {
+	u32 := func(off uint32) uint32 { return *(*uint32)(unsafe.Pointer(&cqRing[off])) }
+	if u32(reported.entries) == cqEntriesWant {
+		return cqEntriesWant, reported, nil
+	}
+	unified := cqLayout{head: 8, tail: 12, mask: 20, entries: 28, cqes: 64}
+	if u32(unified.entries) == cqEntriesWant && u32(unified.mask) == cqEntriesWant-1 {
+		return cqEntriesWant, unified, nil
+	}
+	return 0, cqLayout{}, fmt.Errorf(
+		"unknown CQ ring layout: entries@%d=%d entries@28=%d mask@%d=%d mask@20=%d, want %d",
+		reported.entries, u32(reported.entries), u32(28),
+		reported.mask, u32(reported.mask), u32(20), cqEntriesWant)
+}
+
 func newRawRing(entries uint32) (*rawRing, error) {
 	var params ioUringParams
 	fd, _, errno := syscall.Syscall(sysIoUringSetup, uintptr(entries), uintptr(unsafe.Pointer(&params)), 0)
@@ -98,7 +125,11 @@ func newRawRing(entries uint32) (*rawRing, error) {
 	r := &rawRing{fd: int(fd)}
 
 	sqSize := int64(params.SqOff.Array) + int64(params.SqEntries)*4
+	// map enough for both the reported and the unified cqes placement
 	cqSize := int64(params.CqOff.Cqes) + int64(params.CqEntries)*16
+	if unified := 64 + int64(params.CqEntries)*16; unified > cqSize {
+		cqSize = unified
+	}
 	r.sqRing = mmapRing(r.fd, offSqRing, sqSize)
 	r.cqRing = mmapRing(r.fd, offCqRing, cqSize)
 	r.sqes = mmapRing(r.fd, offSqes, int64(params.SqEntries)*sqeSize)
@@ -107,12 +138,19 @@ func newRawRing(entries uint32) (*rawRing, error) {
 	// the header is padded for atomics: mask lives at offset 16, entries at
 	// 24) - the mask/entries VALUES must be read from the mapped ring header.
 	sqEntries := *(*uint32)(unsafe.Pointer(&r.sqRing[params.SqOff.RingEntries]))
-	cqEntries := *(*uint32)(unsafe.Pointer(&r.cqRing[params.CqOff.RingEntries]))
-	if sqEntries == 0 {
-		sqEntries = params.SqEntries
+	if sqEntries != params.SqEntries {
+		return nil, fmt.Errorf("SQ ring layout mismatch: entries@%d=%d, want %d",
+			params.SqOff.RingEntries, sqEntries, params.SqEntries)
 	}
-	if cqEntries == 0 {
-		cqEntries = params.CqEntries
+	cqEntries, cq, err := resolveCqLayout(r.cqRing, params.CqEntries, cqLayout{
+		head:    params.CqOff.Head,
+		tail:    params.CqOff.Tail,
+		mask:    params.CqOff.RingMask,
+		entries: params.CqOff.RingEntries,
+		cqes:    params.CqOff.Cqes,
+	})
+	if err != nil {
+		return nil, err
 	}
 	// rings are always sized to a power of two: mask = entries - 1
 	r.sqMask = sqEntries - 1
@@ -125,10 +163,10 @@ func newRawRing(entries uint32) (*rawRing, error) {
 
 	r.sqTail = (*uint32)(unsafe.Pointer(&r.sqRing[params.SqOff.Tail]))
 	r.sqHead = (*uint32)(unsafe.Pointer(&r.sqRing[params.SqOff.Head]))
-	r.cqTail = (*uint32)(unsafe.Pointer(&r.cqRing[params.CqOff.Tail]))
-	r.cqHead = (*uint32)(unsafe.Pointer(&r.cqRing[params.CqOff.Head]))
+	r.cqTail = (*uint32)(unsafe.Pointer(&r.cqRing[cq.tail]))
+	r.cqHead = (*uint32)(unsafe.Pointer(&r.cqRing[cq.head]))
 	r.sqArrayOff = params.SqOff.Array
-	r.cqesOff = params.CqOff.Cqes
+	r.cqesOff = cq.cqes
 	return r, nil
 }
 

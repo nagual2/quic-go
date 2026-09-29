@@ -11,8 +11,10 @@ package io_uring
 // throttles the sender.
 
 import (
+	"bytes"
 	"net"
 	"testing"
+	"time"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
@@ -151,6 +153,97 @@ func BenchmarkIOURingGSO(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// drainTo reads datagrams from rx until total bytes are received or the
+// deadline expires.
+func drainTo(t *testing.T, rx *net.UDPConn, want int) {
+	t.Helper()
+	got := 0
+	buf := make([]byte, maxPayload)
+	_ = rx.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for got < want {
+		n, err := rx.Read(buf)
+		if err != nil {
+			t.Fatalf("received %d of %d bytes: %v", got, want, err)
+		}
+		got += n
+	}
+}
+
+// End-to-end Submit+Flush: one GSO super-buffer goes through the ring as a
+// single SENDMSG with the UDP_SEGMENT cmsg; the receiver observes the
+// kernel-segmented datagrams.
+func TestSenderUDPLoopbackGSO(t *testing.T) {
+	rx, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rx.Close()
+	_ = rx.SetReadBuffer(rxBuffer)
+	tx, err := net.DialUDP("udp", nil, rx.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Close()
+	f, err := tx.File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	s, err := NewSender(int(f.Fd()), gsoSize)
+	if err != nil {
+		t.Skipf("io_uring unavailable: %v", err)
+	}
+	defer s.Close()
+
+	payload := bytes.Repeat([]byte{0xAB}, superBufLen)
+	if err := s.Submit(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	drainTo(t, rx, superBufLen)
+}
+
+// Same loop over a batch of super-buffers: ringEntries payloads enqueued
+// before a single Flush reaps all completions.
+func TestSenderUDPLoopbackBatch(t *testing.T) {
+	rx, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rx.Close()
+	_ = rx.SetReadBuffer(rxBuffer)
+	tx, err := net.DialUDP("udp", nil, rx.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Close()
+	f, err := tx.File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	s, err := NewSender(int(f.Fd()), gsoSize)
+	if err != nil {
+		t.Skipf("io_uring unavailable: %v", err)
+	}
+	defer s.Close()
+
+	payload := bytes.Repeat([]byte{0xCD}, superBufLen)
+	for i := 0; i < ringEntries; i++ {
+		if err := s.Submit(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	drainTo(t, rx, superBufLen*ringEntries)
 }
 
 var _ = net.IPv4len
