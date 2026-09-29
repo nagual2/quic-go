@@ -43,7 +43,7 @@ type ioUringParams struct {
 }
 
 type ioUringSqOff struct {
-	Head, Tail, RingMask, RingEntries, Flags, Dropped, Array, Resv1 uint32
+	Head, Tail, RingMask, RingEntries, Flags, Dropped, Array, Resv1, Resv2 uint32
 }
 
 type ioUringCqOff struct {
@@ -64,17 +64,18 @@ type ioUringSQE struct {
 }
 
 type rawRing struct {
-	fd      int
-	sqRing  []byte
-	cqRing  []byte
-	sqes    []byte
-	sqMask  uint32
-	cqMask  uint32
-	sqTail  *uint32
-	sqHead  *uint32
-	sqArray *uint32
-	cqTail  *uint32
-	cqHead  *uint32
+	fd         int
+	sqRing     []byte
+	cqRing     []byte
+	sqes       []byte
+	sqMask     uint32 // ring mask VALUE, read from the mapped ring header
+	cqMask     uint32
+	sqArrayOff uint32 // byte offset of the SQ index array inside sqRing
+	cqesOff    uint32 // byte offset of the CQE array inside cqRing
+	sqTail     *uint32
+	sqHead     *uint32
+	cqTail     *uint32
+	cqHead     *uint32
 }
 
 func mmapRing(fd int, off, size int64) []byte {
@@ -102,13 +103,32 @@ func newRawRing(entries uint32) (*rawRing, error) {
 	r.cqRing = mmapRing(r.fd, offCqRing, cqSize)
 	r.sqes = mmapRing(r.fd, offSqes, int64(params.SqEntries)*sqeSize)
 
-	r.sqMask = params.SqOff.RingMask
-	r.cqMask = params.CqOff.RingMask
+	// TRAP: params.SqOff.* are byte OFFSETS into the mmap (on kernels >= 6.12
+	// the header is padded for atomics: mask lives at offset 16, entries at
+	// 24) - the mask/entries VALUES must be read from the mapped ring header.
+	sqEntries := *(*uint32)(unsafe.Pointer(&r.sqRing[params.SqOff.RingEntries]))
+	cqEntries := *(*uint32)(unsafe.Pointer(&r.cqRing[params.CqOff.RingEntries]))
+	if sqEntries == 0 {
+		sqEntries = params.SqEntries
+	}
+	if cqEntries == 0 {
+		cqEntries = params.CqEntries
+	}
+	// rings are always sized to a power of two: mask = entries - 1
+	r.sqMask = sqEntries - 1
+	r.cqMask = cqEntries - 1
+
+	// the application owns the SQ index array: identity mapping
+	for i := uint32(0); i < params.SqEntries; i++ {
+		*(*uint32)(unsafe.Pointer(&r.sqRing[params.SqOff.Array+4*i])) = i
+	}
+
 	r.sqTail = (*uint32)(unsafe.Pointer(&r.sqRing[params.SqOff.Tail]))
 	r.sqHead = (*uint32)(unsafe.Pointer(&r.sqRing[params.SqOff.Head]))
 	r.cqTail = (*uint32)(unsafe.Pointer(&r.cqRing[params.CqOff.Tail]))
 	r.cqHead = (*uint32)(unsafe.Pointer(&r.cqRing[params.CqOff.Head]))
-	r.sqArray = (*uint32)(unsafe.Pointer(&r.sqRing[params.SqOff.Array]))
+	r.sqArrayOff = params.SqOff.Array
+	r.cqesOff = params.CqOff.Cqes
 	return r, nil
 }
 
@@ -134,9 +154,9 @@ func (r *rawRing) prepareSendMsg(fd int, msg unsafe.Pointer) (slot uint32, err e
 	sqe.Addr = uint64(uintptr(msg))
 	sqe.Len = 1
 	sqe.UserData = uint64(slot)
-	atomic.StoreUint32((*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(r.sqArray))+4*uintptr(slot&(r.sqMask)))), slot)
-	// publish the SQE before advancing the tail: on x86_64 the atomic store
-	// below is a full release for the preceding stores
+	// publish the SQE index in the SQ array before advancing the tail: on
+	// x86_64 the atomic store below is a full release for the preceding stores
+	*(*uint32)(unsafe.Pointer(&r.sqRing[r.sqArrayOff+4*slot])) = slot
 	atomic.StoreUint32(r.sqTail, tail+1)
 	return slot, nil
 }
@@ -162,7 +182,7 @@ func (r *rawRing) reapCQEs(max uint32) (uint32, error) {
 		if head == tail {
 			return reaped, nil
 		}
-		cqe := (*ioUringCQE)(unsafe.Pointer(&r.cqRing[(head&r.cqMask)*16]))
+		cqe := (*ioUringCQE)(unsafe.Pointer(&r.cqRing[r.cqesOff+(head&r.cqMask)*16]))
 		res := int32(atomic.LoadInt32((*int32)(unsafe.Pointer(&cqe.Res))))
 		atomic.StoreUint32(r.cqHead, head+1)
 		if res < 0 {
